@@ -27,7 +27,7 @@ jobs:
       run: python build_exe.py
     
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: FL26-Manual-Editor
         path: dist/FL26ManualEditor/
