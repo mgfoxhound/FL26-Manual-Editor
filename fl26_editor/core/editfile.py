@@ -1,4 +1,4 @@
-"""Binary EDIT file parser and manipulation engine.
+"""Binary EDIT file parser and manipulation engine for FL26.
 
 Reads and writes the decrypted data.dat file according to the PES 2021/FL26
 edit-file binary format. Handles:
@@ -38,7 +38,7 @@ TEAM_PLAYER_ENTRY_SIZE = 0x11C  # 284 bytes
 GAME_PLAN_ENTRY_SIZE = 0x274  # 628 bytes
 COMPETITION_SECTION_SIZE = 0x1230  # 4656 bytes
 
-# MAX allocated slots (vanilla PES21)
+# MAX allocated slots (vanilla PES21 / FL26 compatible)
 MAX_PLAYERS = 30_000
 MAX_TEAMS = 750
 MAX_MANAGERS = 1_300
@@ -84,35 +84,22 @@ class EditFile:
     """Decrypted EDIT file reader/writer.
 
     Usage:
-        ef = EditFile("path/to/data.dat")
-        ef.load()
+        ef = EditFile()
+        ef.load_bytes(decrypted_data)
 
-        # Read data
         players = ef.get_all_players()
         teams = ef.get_all_teams()
-        roster = ef.get_team_roster(team_id=101)
 
-        # Make changes
         ef.transfer_player(player_id=12345, from_team=101, to_team=202)
-
-        # Undo if needed
-        ef.undo()
-
-        # Save
-        ef.save("path/to/data.dat")
+        ef.save_bytes()  # Returns modified data
     """
 
-    def __init__(self, path: Optional[Path] = None):
-        self.path = Path(path) if path else None
+    def __init__(self):
         self._data: bytearray = bytearray()
-        self._original_data: bytearray = bytearray()  # For round-trip validation
-        self._undo_stack: List[bytearray] = []  # Undo history
+        self._undo_stack: List[bytearray] = []
         self._max_undo_depth = 50
 
-        # Metadata from header
         self.metadata = EditFileMetadata()
-
-        # Cached offsets
         self.offsets = {
             "players": 0,
             "teams": 0,
@@ -125,35 +112,21 @@ class EditFile:
             "game_plan": 0,
         }
 
-    def load(self, path: Optional[Path] = None) -> None:
-        """Load and parse data.dat from disk."""
-        if path:
-            self.path = Path(path)
-        if not self.path or not self.path.exists():
-            raise FileNotFoundError(f"data.dat not found: {self.path}")
-
-        with open(self.path, "rb") as f:
-            self._data = bytearray(f.read())
-
-        self._original_data = bytearray(self._data)  # Keep copy for validation
-        logger.info(f"Loaded {len(self._data):,} bytes from {self.path}")
-        self._parse_header()
-        self._calculate_offsets()
-
     def load_bytes(self, data: bytes) -> None:
-        """Load from raw bytes (for testing)."""
+        """Load from raw bytes."""
         self._data = bytearray(data)
-        self._original_data = bytearray(self._data)
         self._parse_header()
         self._calculate_offsets()
+        logger.info(f"Loaded {len(self._data):,} bytes")
+
+    def save_bytes(self) -> bytes:
+        """Return modified data as bytes."""
+        return bytes(self._data)
 
     def _parse_header(self) -> None:
-        """Read entry counts from the header."""
+        """Read entry counts from header."""
         if len(self._data) < HEADER_SIZE:
-            raise ValueError(
-                f"Data too small ({len(self._data)} bytes), "
-                f"expected at least {HEADER_SIZE}"
-            )
+            raise ValueError(f"Data too small: {len(self._data)} < {HEADER_SIZE}")
 
         self.metadata.player_count = struct.unpack_from(
             "<H", self._data, HDR_PLAYER_COUNT
@@ -180,10 +153,10 @@ class EditFile:
             "<H", self._data, HDR_GAME_PLAN_COUNT
         )[0]
 
-        logger.info(f"Parsed header: {self.metadata}")
+        logger.info(f"Header: {self.metadata}")
 
     def _calculate_offsets(self) -> None:
-        """Calculate table start positions from fixed MAX slot sizes."""
+        """Calculate table start positions."""
         player_start = HEADER_SIZE
         team_start = player_start + MAX_PLAYERS * PLAYER_TOTAL_SIZE
         manager_start = team_start + MAX_TEAMS * TEAM_ENTRY_SIZE
@@ -205,7 +178,6 @@ class EditFile:
             "competition_entry": competition_entry_start,
             "game_plan": game_plan_start,
         }
-        logger.info(f"Calculated offsets: {self.offsets}")
 
     def _read_string(self, offset: int, max_len: int) -> str:
         """Read null-terminated string."""
@@ -226,27 +198,21 @@ class EditFile:
             self._undo_stack.pop(0)
 
     def undo(self) -> bool:
-        """Undo the last change. Returns True if successful."""
+        """Undo last change."""
         if not self._undo_stack:
-            logger.warning("Undo stack is empty")
             return False
         self._data = self._undo_stack.pop()
         logger.info("Undo applied")
         return True
 
     def get_all_players(self) -> Dict[int, PlayerInfo]:
-        """Read all players from the EDIT file.
-
-        Returns:
-            {player_id: PlayerInfo}
-        """
+        """Read all players."""
         players: Dict[int, PlayerInfo] = {}
 
         for i in range(self.metadata.player_count):
             entry_offset = self.offsets["players"] + i * PLAYER_TOTAL_SIZE
 
             if entry_offset + PLAYER_ENTRY_SIZE > len(self._data):
-                logger.warning(f"Player entry {i} exceeds data size")
                 break
 
             player_id = struct.unpack_from(
@@ -260,7 +226,7 @@ class EditFile:
 
             players[player_id] = PlayerInfo(
                 player_id=player_id,
-                name=name,
+                name=name or f"Player {player_id}",
                 print_name=print_name or name,
             )
 
@@ -268,18 +234,13 @@ class EditFile:
         return players
 
     def get_all_teams(self) -> Dict[int, TeamInfo]:
-        """Read all teams.
-
-        Returns:
-            {team_id: TeamInfo}
-        """
+        """Read all teams."""
         teams: Dict[int, TeamInfo] = {}
 
         for i in range(self.metadata.team_count):
             entry_offset = self.offsets["teams"] + i * TEAM_ENTRY_SIZE
 
             if entry_offset + TEAM_ENTRY_SIZE > len(self._data):
-                logger.warning(f"Team entry {i} exceeds data size")
                 break
 
             team_id = struct.unpack_from(
@@ -290,21 +251,18 @@ class EditFile:
             )[0]
             name = self._read_string(entry_offset + TE_TEAM_NAME, 70)
 
-            teams[team_id] = TeamInfo(
-                team_id=team_id,
-                name=name,
-                manager_id=manager_id,
-            )
+            if name or team_id > 0:
+                teams[team_id] = TeamInfo(
+                    team_id=team_id,
+                    name=name or f"Team {team_id}",
+                    manager_id=manager_id,
+                )
 
         logger.info(f"Read {len(teams)} teams")
         return teams
 
     def get_all_managers(self) -> Dict[int, ManagerInfo]:
-        """Read all managers.
-
-        Returns:
-            {manager_id: ManagerInfo}
-        """
+        """Read all managers."""
         managers: Dict[int, ManagerInfo] = {}
 
         for i in range(self.metadata.manager_count):
@@ -323,7 +281,7 @@ class EditFile:
             if mgr_id != 0 or name:
                 managers[mgr_id] = ManagerInfo(
                     manager_id=mgr_id,
-                    name=name,
+                    name=name or f"Manager {mgr_id}",
                     nationality=nat,
                 )
 
@@ -331,14 +289,7 @@ class EditFile:
         return managers
 
     def get_team_roster(self, team_id: int) -> Optional[TeamRoster]:
-        """Read a team's roster.
-
-        Args:
-            team_id: Team ID to look up.
-
-        Returns:
-            TeamRoster or None if not found.
-        """
+        """Read a team's roster."""
         for i in range(self.metadata.team_player_count):
             entry_offset = self.offsets["team_player"] + i * TEAM_PLAYER_ENTRY_SIZE
 
@@ -374,11 +325,7 @@ class EditFile:
         return None
 
     def get_all_rosters(self) -> Dict[int, TeamRoster]:
-        """Read all team rosters.
-
-        Returns:
-            {team_id: TeamRoster}
-        """
+        """Read all rosters."""
         rosters: Dict[int, TeamRoster] = {}
         for i in range(self.metadata.team_player_count):
             entry_offset = self.offsets["team_player"] + i * TEAM_PLAYER_ENTRY_SIZE
@@ -414,7 +361,7 @@ class EditFile:
         return rosters
 
     def _find_team_player_entry_offset(self, team_id: int) -> Optional[int]:
-        """Find byte offset of a team's Team-Player table entry."""
+        """Find byte offset of team's roster entry."""
         for i in range(self.metadata.team_player_count):
             offset = self.offsets["team_player"] + i * TEAM_PLAYER_ENTRY_SIZE
             if offset + 4 > len(self._data):
@@ -448,41 +395,26 @@ class EditFile:
         to_team_id: int,
         shirt_number: Optional[int] = None,
     ) -> bool:
-        """Transfer a player from one team to another.
-
-        Args:
-            player_id: Player to transfer.
-            from_team_id: Source team ID.
-            to_team_id: Destination team ID.
-            shirt_number: Optional preferred shirt number.
-
-        Returns:
-            True if successful, False otherwise.
-        """
+        """Transfer a player from one team to another."""
         self._push_undo()
 
         if from_team_id == to_team_id:
-            logger.error("Source and destination are the same team")
+            logger.error("Source and destination are the same")
             return False
 
         from_entry = self._find_team_player_entry_offset(from_team_id)
         to_entry = self._find_team_player_entry_offset(to_team_id)
 
-        if from_entry is None:
-            logger.error(f"Source team {from_team_id} not found")
-            return False
-        if to_entry is None:
-            logger.error(f"Destination team {to_team_id} not found")
+        if from_entry is None or to_entry is None:
+            logger.error("Team not found")
             return False
 
         from_roster = self.get_team_roster(from_team_id)
         to_roster = self.get_team_roster(to_team_id)
 
         if from_roster is None or to_roster is None:
-            logger.error("Could not read rosters")
             return False
 
-        # Find player in source
         player_idx = from_roster.get_player_index(player_id)
         if player_idx == -1:
             logger.error(f"Player {player_id} not found on team {from_team_id}")
@@ -493,10 +425,10 @@ class EditFile:
             return False
 
         if to_roster.is_full:
-            logger.error(f"Destination team {to_team_id} roster is full (40/40)")
+            logger.error(f"Destination team roster is full (40/40)")
             return False
 
-        # Remove from source (compact by shifting last player)
+        # Remove from source
         last_idx = -1
         for k in range(TP_MAX_PLAYERS - 1, -1, -1):
             if from_roster.player_ids[k] != 0:
@@ -517,45 +449,34 @@ class EditFile:
             self._write_player_slot(from_entry, player_idx, 0, 0)
 
         # Add to destination
-        dest_slot = to_roster.first_empty_slot() if hasattr(to_roster, 'first_empty_slot') else -1
-        if dest_slot == -1:
-            # Manual search
-            for i in range(TP_MAX_PLAYERS):
-                if to_roster.player_ids[i] == 0:
-                    dest_slot = i
-                    break
+        dest_slot = -1
+        for i in range(TP_MAX_PLAYERS):
+            if to_roster.player_ids[i] == 0:
+                dest_slot = i
+                break
 
         if dest_slot == -1:
-            logger.error("No empty slot in destination roster")
+            logger.error("No empty slot in destination")
             return False
 
         final_shirt = shirt_number if shirt_number else from_roster.shirt_numbers[player_idx]
         if final_shirt == 0:
-            final_shirt = dest_slot + 1  # Default to slot + 1
+            final_shirt = dest_slot + 1
 
         self._write_player_slot(to_entry, dest_slot, player_id, final_shirt)
 
         logger.info(
             f"Transferred player {player_id} from team {from_team_id} "
-            f"(slot {player_idx}) to team {to_team_id} (slot {dest_slot}, shirt #{final_shirt})"
+            f"to team {to_team_id} (shirt #{final_shirt})"
         )
         return True
 
     def release_player(self, player_id: int, from_team_id: int) -> bool:
-        """Release a player from a team (becomes Free Agent).
-
-        Args:
-            player_id: Player to release.
-            from_team_id: Team to remove player from.
-
-        Returns:
-            True if successful, False otherwise.
-        """
+        """Release a player from a team."""
         self._push_undo()
 
         from_entry = self._find_team_player_entry_offset(from_team_id)
         if from_entry is None:
-            logger.error(f"Team {from_team_id} not found")
             return False
 
         from_roster = self.get_team_roster(from_team_id)
@@ -564,10 +485,8 @@ class EditFile:
 
         player_idx = from_roster.get_player_index(player_id)
         if player_idx == -1:
-            logger.error(f"Player {player_id} not found on team {from_team_id}")
             return False
 
-        # Find last player and compact
         last_idx = -1
         for k in range(TP_MAX_PLAYERS - 1, -1, -1):
             if from_roster.player_ids[k] != 0:
@@ -593,20 +512,10 @@ class EditFile:
     def update_shirt_number(
         self, team_id: int, player_id: int, shirt_number: int
     ) -> bool:
-        """Update a player's shirt number.
-
-        Args:
-            team_id: Team ID.
-            player_id: Player ID.
-            shirt_number: New shirt number (1-999).
-
-        Returns:
-            True if successful, False otherwise.
-        """
+        """Update player's shirt number."""
         self._push_undo()
 
         if not 1 <= shirt_number <= 999:
-            logger.error(f"Invalid shirt number: {shirt_number}")
             return False
 
         entry = self._find_team_player_entry_offset(team_id)
@@ -621,45 +530,30 @@ class EditFile:
         if idx == -1:
             return False
 
-        # Check for duplicates
         for i, sn in enumerate(roster.shirt_numbers):
             if i != idx and sn == shirt_number and roster.player_ids[i] != 0:
-                logger.warning(f"Shirt #{shirt_number} already used on team {team_id}")
+                logger.warning(f"Shirt #{shirt_number} already used")
                 return False
 
         self._write_player_slot(entry, idx, player_id, shirt_number)
         logger.info(f"Updated player {player_id} shirt to #{shirt_number}")
         return True
 
-    def save(self, path: Optional[Path] = None) -> None:
-        """Write modified data to disk."""
-        save_path = Path(path) if path else self.path
-        if not save_path:
-            raise ValueError("No save path specified")
-
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(self._data)
-
-        logger.info(f"Saved {len(self._data):,} bytes to {save_path}")
-
     def validate_integrity(self) -> Tuple[bool, List[str]]:
-        """Validate file structure. Returns (is_valid, error_list)."""
+        """Validate file structure."""
         errors: List[str] = []
-
-        # Check file size
+        
         expected_size = (
             self.offsets["game_plan"] + MAX_GAME_PLANS * GAME_PLAN_ENTRY_SIZE
         )
         if len(self._data) != expected_size:
             errors.append(
-                f"File size mismatch: {len(self._data):,} vs expected {expected_size:,}"
+                f"File size: {len(self._data):,} (expected {expected_size:,})"
             )
 
-        # Check count limits
         if not 0 <= self.metadata.player_count <= MAX_PLAYERS:
-            errors.append(f"Player count {self.metadata.player_count} out of range")
+            errors.append(f"Player count out of range: {self.metadata.player_count}")
         if not 0 <= self.metadata.team_count <= MAX_TEAMS:
-            errors.append(f"Team count {self.metadata.team_count} out of range")
+            errors.append(f"Team count out of range: {self.metadata.team_count}")
 
         return len(errors) == 0, errors
